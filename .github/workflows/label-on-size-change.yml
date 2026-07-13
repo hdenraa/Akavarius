@@ -1,0 +1,147 @@
+name: Auto-label issues by size
+
+on:
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+
+jobs:
+  label-by-size:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      repository-projects: read
+    steps:
+      - name: Get issue size from project and add label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issueNumber = context.issue.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            
+            // Hent alle projekter for repository
+            const projects = await github.rest.projects.listForRepo({
+              owner: owner,
+              repo: repo,
+              state: 'open'
+            });
+            
+            let sizeValue = null;
+            
+            // Søg gennem projekter efter size field
+            for (const project of projects.data) {
+              try {
+                const cards = await github.rest.projects.listCards({
+                  column_id: null,
+                  project_id: project.id
+                });
+                
+                for (const card of cards.data) {
+                  if (card.content_url && card.content_url.includes(`/issues/${issueNumber}`)) {
+                    sizeValue = card.note;
+                    break;
+                  }
+                }
+                if (sizeValue) break;
+              } catch (e) {
+                console.log(`Could not process project ${project.id}`);
+              }
+            }
+            
+            // Hvis REST API ikke finder det, use GraphQL
+            if (!sizeValue) {
+              const query = `
+                query {
+                  repository(owner: "${owner}", name: "${repo}") {
+                    issue(number: ${issueNumber}) {
+                      projectsV2(first: 10) {
+                        nodes {
+                          title
+                          items(first: 100) {
+                            nodes {
+                              content {
+                                ... on Issue {
+                                  number
+                                }
+                              }
+                              fieldValues(first: 20) {
+                                nodes {
+                                  field {
+                                    ... on ProjectV2Field {
+                                      name
+                                    }
+                                  }
+                                  ... on ProjectV2FieldSingleSelectValue {
+                                    name
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              
+              try {
+                const result = await github.graphql(query);
+                
+                if (result.repository.issue.projectsV2.nodes.length > 0) {
+                  const items = result.repository.issue.projectsV2.nodes[0].items.nodes;
+                  
+                  for (const item of items) {
+                    if (item.content && item.content.number === issueNumber) {
+                      const fieldValues = item.fieldValues.nodes;
+                      
+                      for (const fieldValue of fieldValues) {
+                        if (fieldValue.field && fieldValue.field.name === 'Size') {
+                          sizeValue = fieldValue.name;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                console.log('GraphQL query failed:', e.message);
+              }
+            }
+            
+            // Map T-shirt sizes til labels
+            const sizeMap = {
+              'XS': 'size-xs',
+              'S': 'size-small',
+              'M': 'size-medium',
+              'L': 'size-large',
+              'XL': 'size-xl',
+              'XXL': 'size-xxl'
+            };
+            
+            if (sizeValue && sizeMap[sizeValue]) {
+              const newLabel = sizeMap[sizeValue];
+              
+              const issue = await github.rest.issues.get({
+                owner: owner,
+                repo: repo,
+                issue_number: issueNumber
+              });
+              
+              const currentLabels = issue.data.labels.map(l => l.name);
+              const filteredLabels = currentLabels.filter(l => !l.startsWith('size-'));
+              const allLabels = [...filteredLabels, newLabel];
+              
+              await github.rest.issues.setLabels({
+                owner: owner,
+                repo: repo,
+                issue_number: issueNumber,
+                labels: allLabels
+              });
+              
+              console.log(`✅ Label "${newLabel}" added to issue #${issueNumber}`);
+              console.log(`Size value: ${sizeValue}`);
+            } else {
+              console.log(`⚠️ Size field not found or not set for issue #${issueNumber}`);
+            }
